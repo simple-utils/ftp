@@ -26,16 +26,6 @@ const (
 	DefaultDialTimeout = 30 * time.Second
 )
 
-// EntryType describes the different types of an Entry.
-type EntryType int
-
-// The differents types of an Entry
-const (
-	EntryTypeFile EntryType = iota
-	EntryTypeFolder
-	EntryTypeLink
-)
-
 // TransferType denotes the formats for transferring Entries.
 type TransferType string
 
@@ -59,6 +49,7 @@ type ServerConn struct {
 
 	// Server capabilities discovered at runtime
 	features      map[string]string
+	siteCommands  map[string]struct{} // nil if FEAT did not list any SITE subcommand
 	skipEPSV      bool
 	mlstSupported bool
 	mfmtSupported bool
@@ -89,15 +80,27 @@ type dialOptions struct {
 	shutTimeout     time.Duration // time to wait for data connection closing status
 }
 
-// Entry describes a file and is returned by List().
+// Entry describes a file or directory entry returned by the server.
+// It implements os.FileInfo.
 type Entry struct {
-	Name     string
-	FileMode os.FileMode
-	Target   string // target of symbolic link
-	Type     EntryType
-	Size     uint64
-	Time     time.Time
+	name   string
+	size   int64
+	time   time.Time
+	mode   os.FileMode
+	target string // symlink target, empty otherwise
 }
+
+var _ os.FileInfo = (*Entry)(nil)
+
+func (e *Entry) Name() string       { return e.name }
+func (e *Entry) Size() int64        { return e.size }
+func (e *Entry) Mode() os.FileMode  { return e.mode }
+func (e *Entry) ModTime() time.Time { return e.time }
+func (e *Entry) IsDir() bool        { return e.mode.IsDir() }
+func (e *Entry) Sys() any           { return nil }
+
+// Target returns the target of a symbolic link entry, or an empty string.
+func (e *Entry) Target() string { return e.target }
 
 // Response represents a data-connection
 type Response struct {
@@ -415,6 +418,11 @@ func (c *ServerConn) authTLS() error {
 // the remote FTP server.
 // FEAT is described in RFC 2389
 func (c *ServerConn) feat() error {
+	// Drop any state from a previous Login so a re-login reflects the
+	// current connection.
+	c.features = make(map[string]string)
+	c.siteCommands = nil
+
 	code, message, err := c.cmd(-1, "FEAT")
 	if err != nil {
 		return err
@@ -443,9 +451,26 @@ func (c *ServerConn) feat() error {
 		}
 
 		c.features[command] = commandDesc
+
+		if strings.EqualFold(command, "SITE") {
+			if c.siteCommands == nil {
+				c.siteCommands = make(map[string]struct{})
+			}
+			for _, sub := range strings.Fields(commandDesc) {
+				c.siteCommands[strings.ToUpper(sub)] = struct{}{}
+			}
+		}
 	}
 
 	return nil
+}
+
+// IsSiteCommandSupported reports whether sub was listed by the server as a
+// supported SITE subcommand in FEAT. Many servers implement SITE commands
+// without advertising them, so a false result is not conclusive.
+func (c *ServerConn) IsSiteCommandSupported(sub string) bool {
+	_, ok := c.siteCommands[strings.ToUpper(sub)]
+	return ok
 }
 
 // setUTF8 issues an "OPTS UTF8 ON" command.
@@ -1045,17 +1070,17 @@ func (c *ServerConn) RemoveDirRecur(path string) error {
 	}
 
 	for _, entry := range entries {
-		if entry.Name != ".." && entry.Name != "." {
-			if entry.Type == EntryTypeFolder {
-				err = c.RemoveDirRecur(currentDir + "/" + entry.Name)
-				if err != nil {
-					return err
-				}
-			} else {
-				err = c.Delete(entry.Name)
-				if err != nil {
-					return err
-				}
+		name := entry.Name()
+		if name == "." || name == ".." {
+			continue
+		}
+		if entry.IsDir() {
+			if err := c.RemoveDirRecur(currentDir + "/" + name); err != nil {
+				return err
+			}
+		} else {
+			if err := c.Delete(name); err != nil {
+				return err
 			}
 		}
 	}
@@ -1126,9 +1151,45 @@ func (c *ServerConn) Quit() error {
 	return errs.ErrorOrNil()
 }
 
-// Chmod issues a SITE CHMOD command to set permissions for file/directory
+// ErrSiteCommandNotSupported is returned when FEAT enumerated the server's
+// SITE subcommands and the one being invoked is not among them.
+var ErrSiteCommandNotSupported = errors.New("SITE command not supported by server")
+
+func (c *ServerConn) checkSiteCommand(sub string) error {
+	if c.siteCommands == nil {
+		return nil
+	}
+	if _, ok := c.siteCommands[strings.ToUpper(sub)]; ok {
+		return nil
+	}
+	return fmt.Errorf("SITE %s: %w", strings.ToUpper(sub), ErrSiteCommandNotSupported)
+}
+
+// Chmod issues a SITE CHMOD command. Only the permission, setuid, setgid
+// and sticky bits of perm are sent.
+//
+// SITE CHMOD is a non-standard extension and is not supported by every server.
 func (c *ServerConn) Chmod(path string, perm os.FileMode) error {
-	_, _, err := c.cmd(StatusCommandOK, "SITE CHMOD %s %s", fmt.Sprintf("%o", perm.Perm()), path)
+	if err := c.checkSiteCommand("CHMOD"); err != nil {
+		return err
+	}
+	_, _, err := c.cmd(StatusCommandOK, "SITE CHMOD %o %s", fileModeToUnixMode(perm), path)
+	return err
+}
+
+// Chown issues a SITE CHOWN command. If group is non-empty the request is
+// sent as "owner:group".
+//
+// SITE CHOWN is a non-standard extension and is not supported by every server.
+func (c *ServerConn) Chown(path, owner, group string) error {
+	if err := c.checkSiteCommand("CHOWN"); err != nil {
+		return err
+	}
+	spec := owner
+	if group != "" {
+		spec = owner + ":" + group
+	}
+	_, _, err := c.cmd(StatusCommandOK, "SITE CHOWN %s %s", spec, path)
 	return err
 }
 
@@ -1161,9 +1222,4 @@ func (r *Response) Close() error {
 // SetDeadline sets the deadlines associated with the connection.
 func (r *Response) SetDeadline(t time.Time) error {
 	return r.conn.SetDeadline(t)
-}
-
-// String returns the string representation of EntryType t.
-func (t EntryType) String() string {
-	return [...]string{"file", "folder", "link"}[t]
 }

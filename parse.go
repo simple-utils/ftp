@@ -9,6 +9,7 @@ import (
 	"time"
 )
 
+// permMap maps each position in an ls-style permission string to its bit.
 var permMap = []struct {
 	char byte
 	bit  os.FileMode
@@ -18,9 +19,41 @@ var permMap = []struct {
 	{'r', 0004}, {'w', 0002}, {'x', 0001}, // others
 }
 
-var errUnsupportedListLine = errors.New("unsupported LIST line")
-var errUnsupportedListDate = errors.New("unsupported LIST date")
-var errUnknownListEntryType = errors.New("unknown entry type")
+// unixModeToFileMode converts a 12-bit unix mode into os.FileMode.
+func unixModeToFileMode(mode uint32) os.FileMode {
+	fm := os.FileMode(mode & 0777)
+	if mode&04000 != 0 {
+		fm |= os.ModeSetuid
+	}
+	if mode&02000 != 0 {
+		fm |= os.ModeSetgid
+	}
+	if mode&01000 != 0 {
+		fm |= os.ModeSticky
+	}
+	return fm
+}
+
+// fileModeToUnixMode is the inverse of unixModeToFileMode.
+func fileModeToUnixMode(fm os.FileMode) uint32 {
+	mode := uint32(fm.Perm())
+	if fm&os.ModeSetuid != 0 {
+		mode |= 04000
+	}
+	if fm&os.ModeSetgid != 0 {
+		mode |= 02000
+	}
+	if fm&os.ModeSticky != 0 {
+		mode |= 01000
+	}
+	return mode
+}
+
+var (
+	errUnsupportedListLine  = errors.New("unsupported LIST line")
+	errUnsupportedListDate  = errors.New("unsupported LIST date")
+	errUnknownListEntryType = errors.New("unknown entry type")
+)
 
 type parseFunc func(string, time.Time, *time.Location) (*Entry, error)
 
@@ -52,9 +85,9 @@ func parseNextRFC3659ListLine(line string, loc *time.Location, e *Entry) (*Entry
 	}
 
 	name := line[iWhitespace+1:]
-	if e.Name == "" {
-		e.Name = name
-	} else if e.Name != name {
+	if e.name == "" {
+		e.name = name
+	} else if e.name != name {
 		// All lines must have the same name
 		return nil, errUnsupportedListLine
 	}
@@ -70,23 +103,23 @@ func parseNextRFC3659ListLine(line string, loc *time.Location, e *Entry) (*Entry
 
 		switch key {
 		case "unix.mode":
-			if parsedFileMode, err := strconv.ParseInt(value, 8, 64); err != nil {
+			mode, err := strconv.ParseUint(value, 8, 32)
+			if err != nil {
 				return nil, err
-			} else {
-				e.FileMode = os.FileMode(parsedFileMode)
 			}
+			// Don't clobber type bits set by an earlier "type" fact.
+			const lowBits = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+			e.mode = (e.mode &^ lowBits) | unixModeToFileMode(uint32(mode))
 		case "modify":
 			var err error
-			e.Time, err = time.ParseInLocation("20060102150405", value, loc)
+			e.time, err = time.ParseInLocation("20060102150405", value, loc)
 			if err != nil {
 				return nil, err
 			}
 		case "type":
 			switch value {
 			case "dir", "cdir", "pdir":
-				e.Type = EntryTypeFolder
-			case "file":
-				e.Type = EntryTypeFile
+				e.mode |= os.ModeDir
 			}
 		case "size":
 			if err := e.setSize(value); err != nil {
@@ -115,20 +148,44 @@ func parseLsListLine(line string, now time.Time, loc *time.Location) (*Entry, er
 		return nil, errUnsupportedListLine
 	}
 
-	fileMode := os.FileMode(0)
-	if len(fields[0]) == 10 {
+	// Decode the permission column, e.g. "-rwxr-xr-x" or "drwxr-xr-x+"
+	// (with an ACL marker). Uppercase 'S'/'T' mean the special bit is set
+	// without the execute bit; lowercase implies execute too.
+	var fileMode os.FileMode
+	if len(fields[0]) >= 10 {
 		for i, pm := range permMap {
 			c := fields[0][i+1]
-			if c == pm.char || (pm.char == 'x' && c == 's') {
+			switch {
+			case c == pm.char:
 				fileMode |= pm.bit
+			case pm.char == 'x' && (c == 's' || c == 'S'):
+				if i < 3 {
+					fileMode |= os.ModeSetuid
+				} else {
+					fileMode |= os.ModeSetgid
+				}
+				if c == 's' {
+					fileMode |= pm.bit
+				}
+			case pm.char == 'x' && (c == 't' || c == 'T'):
+				fileMode |= os.ModeSticky
+				if c == 't' {
+					fileMode |= pm.bit
+				}
 			}
+		}
+		switch fields[0][0] {
+		case 'd':
+			fileMode |= os.ModeDir
+		case 'l':
+			fileMode |= os.ModeSymlink
 		}
 	}
 
 	if fields[1] == "folder" && fields[2] == "0" {
 		e := &Entry{
-			Type: EntryTypeFolder,
-			Name: scanner.Remaining(),
+			mode: fileMode | os.ModeDir,
+			name: scanner.Remaining(),
 		}
 		if err := e.setTime(fields[3:6], now, loc); err != nil {
 			return nil, err
@@ -140,8 +197,8 @@ func parseLsListLine(line string, now time.Time, loc *time.Location) (*Entry, er
 	if fields[1] == "0" {
 		fields = append(fields, scanner.Next())
 		e := &Entry{
-			Type: EntryTypeFile,
-			Name: scanner.Remaining(),
+			mode: fileMode,
+			name: scanner.Remaining(),
 		}
 
 		if err := e.setSize(fields[2]); err != nil {
@@ -161,24 +218,20 @@ func parseLsListLine(line string, now time.Time, loc *time.Location) (*Entry, er
 	}
 
 	e := &Entry{
-		FileMode: fileMode,
-		Name:     scanner.Remaining(),
+		mode: fileMode,
+		name: scanner.Remaining(),
 	}
 	switch fields[0][0] {
 	case '-':
-		e.Type = EntryTypeFile
 		if err := e.setSize(fields[4]); err != nil {
-			return nil, err
+			return nil, errUnsupportedListLine
 		}
 	case 'd':
-		e.Type = EntryTypeFolder
+		// type bit already set above
 	case 'l':
-		e.Type = EntryTypeLink
-
-		// Split link name and target
-		if i := strings.Index(e.Name, " -> "); i > 0 {
-			e.Target = e.Name[i+4:]
-			e.Name = e.Name[:i]
+		if i := strings.Index(e.name, " -> "); i > 0 {
+			e.target = e.name[i+4:]
+			e.name = e.name[:i]
 		}
 	default:
 		return nil, errUnknownListEntryType
@@ -200,7 +253,7 @@ func parseDirListLine(line string, now time.Time, loc *time.Location) (*Entry, e
 	// Try various time formats that DIR might use, and stop when one works.
 	for _, format := range dirTimeFormats {
 		if len(line) > len(format) {
-			e.Time, err = time.ParseInLocation(format, line[:len(format)], loc)
+			e.time, err = time.ParseInLocation(format, line[:len(format)], loc)
 			if err == nil {
 				line = line[len(format):]
 				break
@@ -214,22 +267,21 @@ func parseDirListLine(line string, now time.Time, loc *time.Location) (*Entry, e
 
 	line = strings.TrimLeft(line, " ")
 	if strings.HasPrefix(line, "<DIR>") {
-		e.Type = EntryTypeFolder
+		e.mode |= os.ModeDir
 		line = strings.TrimPrefix(line, "<DIR>")
 	} else {
 		space := strings.Index(line, " ")
 		if space == -1 {
 			return nil, errUnsupportedListLine
 		}
-		e.Size, err = strconv.ParseUint(line[:space], 10, 64)
+		e.size, err = strconv.ParseInt(line[:space], 10, 64)
 		if err != nil {
 			return nil, errUnsupportedListLine
 		}
-		e.Type = EntryTypeFile
 		line = line[space:]
 	}
 
-	e.Name = strings.TrimLeft(line, " ")
+	e.name = strings.TrimLeft(line, " ")
 	return e, nil
 }
 
@@ -267,7 +319,7 @@ func parseListLine(line string, now time.Time, loc *time.Location) (*Entry, erro
 }
 
 func (e *Entry) setSize(str string) (err error) {
-	e.Size, err = strconv.ParseUint(str, 0, 64)
+	e.size, err = strconv.ParseInt(str, 0, 64)
 	return
 }
 
@@ -275,7 +327,7 @@ func (e *Entry) setTime(fields []string, now time.Time, loc *time.Location) (err
 	if strings.Contains(fields[2], ":") { // contains time
 		thisYear, _, _ := now.Date()
 		timeStr := fmt.Sprintf("%s %s %d %s", fields[1], fields[0], thisYear, fields[2])
-		e.Time, err = time.ParseInLocation("_2 Jan 2006 15:04", timeStr, loc)
+		e.time, err = time.ParseInLocation("_2 Jan 2006 15:04", timeStr, loc)
 
 		/*
 			On unix, `info ls` shows:
@@ -289,8 +341,8 @@ func (e *Entry) setTime(fields []string, now time.Time, loc *time.Location) (err
 			means you probably have clock skew problems which may break programs
 			like ‘make’ that rely on file timestamps.
 		*/
-		if !e.Time.Before(now.AddDate(0, 6, 0)) {
-			e.Time = e.Time.AddDate(-1, 0, 0)
+		if !e.time.Before(now.AddDate(0, 6, 0)) {
+			e.time = e.time.AddDate(-1, 0, 0)
 		}
 
 	} else { // only the date
@@ -298,7 +350,7 @@ func (e *Entry) setTime(fields []string, now time.Time, loc *time.Location) (err
 			return errUnsupportedListDate
 		}
 		timeStr := fmt.Sprintf("%s %s %s 00:00", fields[1], fields[0], fields[2])
-		e.Time, err = time.ParseInLocation("_2 Jan 2006 15:04", timeStr, loc)
+		e.time, err = time.ParseInLocation("_2 Jan 2006 15:04", timeStr, loc)
 	}
 	return
 }

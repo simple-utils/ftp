@@ -90,7 +90,7 @@ func (mock *ftpMock) listen() {
 		// At least one command must have a multiline response
 		switch cmdParts[0] {
 		case "FEAT":
-			features := "211-Features:\r\n FEAT\r\n PASV\r\n EPSV\r\n UTF8\r\n SIZE\r\n MLST\r\n"
+			features := "211-Features:\r\n FEAT\r\n PASV\r\n EPSV\r\n UTF8\r\n SIZE\r\n MLST\r\n SITE CHMOD CHOWN\r\n"
 			switch mock.modtime {
 			case "std-time":
 				features += " MDTM\r\n MFMT\r\n"
@@ -286,6 +286,12 @@ func (mock *ftpMock) listen() {
 					break
 				}
 				mock.printfLine("200 SITE CHMOD command successful")
+			case "CHOWN":
+				if len(cmdParts) != 4 {
+					mock.printfLine("500 SITE CHOWN needs owner and path arguments")
+					break
+				}
+				mock.printfLine("200 SITE CHOWN command successful")
 			default:
 				mock.printfLine("500 Unknown SITE command %s", cmdParts[1])
 			}

@@ -1,6 +1,7 @@
 package ftp
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -17,11 +18,11 @@ var (
 )
 
 type line struct {
-	line      string
-	name      string
-	size      uint64
-	entryType EntryType
-	time      time.Time
+	line  string
+	name  string
+	size  int64
+	isDir bool
+	time  time.Time
 }
 
 type symlinkLine struct {
@@ -37,50 +38,49 @@ type unsupportedLine struct {
 
 var listTests = []line{
 	// UNIX ls -l style
-	{"drwxr-xr-x    3 110      1002            3 Dec 02  2009 pub", "pub", 0, EntryTypeFolder, newTime(2009, time.December, 2)},
-	{"drwxr-xr-x    3 110      1002            3 Dec 02  2009 p u b", "p u b", 0, EntryTypeFolder, newTime(2009, time.December, 2)},
-	{"-rw-r--r--   1 marketwired marketwired    12016 Mar 16  2016 2016031611G087802-001.newsml", "2016031611G087802-001.newsml", 12016, EntryTypeFile, newTime(2016, time.March, 16)},
+	{"drwxr-xr-x    3 110      1002            3 Dec 02  2009 pub", "pub", 0, true, newTime(2009, time.December, 2)},
+	{"drwxr-xr-x    3 110      1002            3 Dec 02  2009 p u b", "p u b", 0, true, newTime(2009, time.December, 2)},
+	{"-rw-r--r--   1 marketwired marketwired    12016 Mar 16  2016 2016031611G087802-001.newsml", "2016031611G087802-001.newsml", 12016, false, newTime(2016, time.March, 16)},
 
-	{"-rwxr-xr-x    3 110      1002            1234567 Dec 02  2009 fileName", "fileName", 1234567, EntryTypeFile, newTime(2009, time.December, 2)},
-	{"lrwxrwxrwx   1 root     other          7 Jan 25 00:17 bin -> usr/bin", "bin", 0, EntryTypeLink, newTime(thisYear, time.January, 25, 0, 17)},
+	{"-rwxr-xr-x    3 110      1002            1234567 Dec 02  2009 fileName", "fileName", 1234567, false, newTime(2009, time.December, 2)},
+	{"lrwxrwxrwx   1 root     other          7 Jan 25 00:17 bin -> usr/bin", "bin", 0, false, newTime(thisYear, time.January, 25, 0, 17)},
 
 	// Another ls style
-	{"drwxr-xr-x               folder        0 Aug 15 05:49 !!!-Tipp des Haus!", "!!!-Tipp des Haus!", 0, EntryTypeFolder, newTime(thisYear, time.August, 15, 5, 49)},
-	{"drwxrwxrwx               folder        0 Aug 11 20:32 P0RN", "P0RN", 0, EntryTypeFolder, newTime(thisYear, time.August, 11, 20, 32)},
-	{"-rw-r--r--        0   18446744073709551615 18446744073709551615 Nov 16  2006 VIDEO_TS.VOB", "VIDEO_TS.VOB", 18446744073709551615, EntryTypeFile, newTime(2006, time.November, 16)},
+	{"drwxr-xr-x               folder        0 Aug 15 05:49 !!!-Tipp des Haus!", "!!!-Tipp des Haus!", 0, true, newTime(thisYear, time.August, 15, 5, 49)},
+	{"drwxrwxrwx               folder        0 Aug 11 20:32 P0RN", "P0RN", 0, true, newTime(thisYear, time.August, 11, 20, 32)},
 
 	// Microsoft's FTP servers for Windows
-	{"----------   1 owner    group         1803128 Jul 10 10:18 ls-lR.Z", "ls-lR.Z", 1803128, EntryTypeFile, newTime(thisYear, time.July, 10, 10, 18)},
-	{"d---------   1 owner    group               0 Nov  9 19:45 Softlib", "Softlib", 0, EntryTypeFolder, newTime(previousYear, time.November, 9, 19, 45)},
+	{"----------   1 owner    group         1803128 Jul 10 10:18 ls-lR.Z", "ls-lR.Z", 1803128, false, newTime(thisYear, time.July, 10, 10, 18)},
+	{"d---------   1 owner    group               0 Nov  9 19:45 Softlib", "Softlib", 0, true, newTime(previousYear, time.November, 9, 19, 45)},
 
 	// WFTPD for MSDOS
-	{"-rwxrwxrwx   1 noone    nogroup      322 Aug 19  1996 message.ftp", "message.ftp", 322, EntryTypeFile, newTime(1996, time.August, 19)},
+	{"-rwxrwxrwx   1 noone    nogroup      322 Aug 19  1996 message.ftp", "message.ftp", 322, false, newTime(1996, time.August, 19)},
 
 	// RFC3659 format: https://tools.ietf.org/html/rfc3659#section-7
-	{"modify=20150813224845;perm=fle;type=cdir;unique=119FBB87U4;UNIX.group=0;UNIX.mode=0755;UNIX.owner=0; .", ".", 0, EntryTypeFolder, newTime(2015, time.August, 13, 22, 48, 45)},
-	{"modify=20150813224845;perm=fle;type=pdir;unique=119FBB87U4;UNIX.group=0;UNIX.mode=0755;UNIX.owner=0; ..", "..", 0, EntryTypeFolder, newTime(2015, time.August, 13, 22, 48, 45)},
-	{"modify=20150806235817;perm=fle;type=dir;unique=1B20F360U4;UNIX.group=0;UNIX.mode=0755;UNIX.owner=0; movies", "movies", 0, EntryTypeFolder, newTime(2015, time.August, 6, 23, 58, 17)},
-	{"modify=20150814172949;perm=flcdmpe;type=dir;unique=85A0C168U4;UNIX.group=0;UNIX.mode=0777;UNIX.owner=0; _upload", "_upload", 0, EntryTypeFolder, newTime(2015, time.August, 14, 17, 29, 49)},
-	{"modify=20150813175250;perm=adfr;size=951;type=file;unique=119FBB87UE;UNIX.group=0;UNIX.mode=0644;UNIX.owner=0; welcome.msg", "welcome.msg", 951, EntryTypeFile, newTime(2015, time.August, 13, 17, 52, 50)},
+	{"modify=20150813224845;perm=fle;type=cdir;unique=119FBB87U4;UNIX.group=0;UNIX.mode=0755;UNIX.owner=0; .", ".", 0, true, newTime(2015, time.August, 13, 22, 48, 45)},
+	{"modify=20150813224845;perm=fle;type=pdir;unique=119FBB87U4;UNIX.group=0;UNIX.mode=0755;UNIX.owner=0; ..", "..", 0, true, newTime(2015, time.August, 13, 22, 48, 45)},
+	{"modify=20150806235817;perm=fle;type=dir;unique=1B20F360U4;UNIX.group=0;UNIX.mode=0755;UNIX.owner=0; movies", "movies", 0, true, newTime(2015, time.August, 6, 23, 58, 17)},
+	{"modify=20150814172949;perm=flcdmpe;type=dir;unique=85A0C168U4;UNIX.group=0;UNIX.mode=0777;UNIX.owner=0; _upload", "_upload", 0, true, newTime(2015, time.August, 14, 17, 29, 49)},
+	{"modify=20150813175250;perm=adfr;size=951;type=file;unique=119FBB87UE;UNIX.group=0;UNIX.mode=0644;UNIX.owner=0; welcome.msg", "welcome.msg", 951, false, newTime(2015, time.August, 13, 17, 52, 50)},
 	// Format and types have first letter UpperCase
-	{"Modify=20150813175250;Perm=adfr;Size=951;Type=file;Unique=119FBB87UE;UNIX.group=0;UNIX.mode=0644;UNIX.owner=0; welcome.msg", "welcome.msg", 951, EntryTypeFile, newTime(2015, time.August, 13, 17, 52, 50)},
+	{"Modify=20150813175250;Perm=adfr;Size=951;Type=file;Unique=119FBB87UE;UNIX.group=0;UNIX.mode=0644;UNIX.owner=0; welcome.msg", "welcome.msg", 951, false, newTime(2015, time.August, 13, 17, 52, 50)},
 
 	// DOS DIR command output
-	{"08-07-15  07:50PM                  718 Post_PRR_20150901_1166_265118_13049.dat", "Post_PRR_20150901_1166_265118_13049.dat", 718, EntryTypeFile, newTime(2015, time.August, 7, 19, 50)},
-	{"08-10-15  02:04PM       <DIR>          Billing", "Billing", 0, EntryTypeFolder, newTime(2015, time.August, 10, 14, 4)},
-	{"08-07-2015  07:50PM                  718 Post_PRR_20150901_1166_265118_13049.dat", "Post_PRR_20150901_1166_265118_13049.dat", 718, EntryTypeFile, newTime(2015, time.August, 7, 19, 50)},
-	{"08-10-2015  02:04PM       <DIR>          Billing", "Billing", 0, EntryTypeFolder, newTime(2015, time.August, 10, 14, 4)},
-	
+	{"08-07-15  07:50PM                  718 Post_PRR_20150901_1166_265118_13049.dat", "Post_PRR_20150901_1166_265118_13049.dat", 718, false, newTime(2015, time.August, 7, 19, 50)},
+	{"08-10-15  02:04PM       <DIR>          Billing", "Billing", 0, true, newTime(2015, time.August, 10, 14, 4)},
+	{"08-07-2015  07:50PM                  718 Post_PRR_20150901_1166_265118_13049.dat", "Post_PRR_20150901_1166_265118_13049.dat", 718, false, newTime(2015, time.August, 7, 19, 50)},
+	{"08-10-2015  02:04PM       <DIR>          Billing", "Billing", 0, true, newTime(2015, time.August, 10, 14, 4)},
+
 	// dir and file names that contain multiple spaces
-	{"drwxr-xr-x    3 110      1002            3 Dec 02  2009 spaces   dir   name", "spaces   dir   name", 0, EntryTypeFolder, newTime(2009, time.December, 2)},
-	{"-rwxr-xr-x    3 110      1002            1234567 Dec 02  2009 file   name", "file   name", 1234567, EntryTypeFile, newTime(2009, time.December, 2)},
-	{"-rwxr-xr-x    3 110      1002            1234567 Dec 02  2009  foo bar ", " foo bar ", 1234567, EntryTypeFile, newTime(2009, time.December, 2)},
+	{"drwxr-xr-x    3 110      1002            3 Dec 02  2009 spaces   dir   name", "spaces   dir   name", 0, true, newTime(2009, time.December, 2)},
+	{"-rwxr-xr-x    3 110      1002            1234567 Dec 02  2009 file   name", "file   name", 1234567, false, newTime(2009, time.December, 2)},
+	{"-rwxr-xr-x    3 110      1002            1234567 Dec 02  2009  foo bar ", " foo bar ", 1234567, false, newTime(2009, time.December, 2)},
 
 	// Odd link count from hostedftp.com
-	{"-r--------   0 user group     65222236 Feb 24 00:39 RegularFile", "RegularFile", 65222236, EntryTypeFile, newTime(thisYear, time.February, 24, 0, 39)},
+	{"-r--------   0 user group     65222236 Feb 24 00:39 RegularFile", "RegularFile", 65222236, false, newTime(thisYear, time.February, 24, 0, 39)},
 
 	// Line with ACL persmissions
-	{"-rwxrw-r--+  1 521      101         2080 May 21 10:53 data.csv", "data.csv", 2080, EntryTypeFile, newTime(thisYear, time.May, 21, 10, 53)},
+	{"-rwxrw-r--+  1 521      101         2080 May 21 10:53 data.csv", "data.csv", 2080, false, newTime(thisYear, time.May, 21, 10, 53)},
 }
 
 var listTestsSymlink = []symlinkLine{
@@ -98,6 +98,7 @@ var listTestsFail = []unsupportedLine{
 	{"total 1", errUnsupportedListLine},
 	{"000000000x ", errUnsupportedListLine}, // see https://github.com/jlaffaye/ftp/issues/97
 	{"", errUnsupportedListLine},
+	{"-rw-r--r--        0   18446744073709551615 18446744073709551615 Nov 16  2006 VIDEO_TS.VOB", errUnsupportedListLine}, // size overflows int64
 }
 
 func TestParseValidListLine(t *testing.T) {
@@ -107,10 +108,10 @@ func TestParseValidListLine(t *testing.T) {
 			entry, err := parseListLine(lt.line, now, time.UTC)
 
 			if assert.NoError(err) {
-				assert.Equal(lt.name, entry.Name)
-				assert.Equal(lt.entryType, entry.Type)
-				assert.Equal(lt.size, entry.Size)
-				assert.Equal(lt.time, entry.Time)
+				assert.Equal(lt.name, entry.Name())
+				assert.Equal(lt.isDir, entry.IsDir())
+				assert.Equal(lt.size, entry.Size())
+				assert.Equal(lt.time, entry.ModTime())
 			}
 		})
 	}
@@ -123,9 +124,9 @@ func TestParseSymlinks(t *testing.T) {
 			entry, err := parseListLine(lt.line, now, time.UTC)
 
 			if assert.NoError(err) {
-				assert.Equal(lt.name, entry.Name)
-				assert.Equal(lt.target, entry.Target)
-				assert.Equal(EntryTypeLink, entry.Type)
+				assert.Equal(lt.name, entry.Name())
+				assert.Equal(lt.target, entry.Target())
+				assert.NotZero(entry.Mode()&os.ModeSymlink, "expected symlink mode bit")
 			}
 		})
 	}
@@ -166,7 +167,7 @@ func TestSettime(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			assert.Equal(t, test.expected, entry.Time)
+			assert.Equal(t, test.expected, entry.ModTime())
 		})
 	}
 }

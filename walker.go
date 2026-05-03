@@ -1,6 +1,7 @@
 package ftp
 
 import (
+	"os"
 	"path"
 )
 
@@ -28,12 +29,12 @@ func (w *Walker) Next() bool {
 		w.cur = &item{
 			path: w.root,
 			entry: &Entry{
-				Type: EntryTypeFolder,
+				mode: os.ModeDir,
 			},
 		}
 	}
 
-	if w.descend && w.cur.entry.Type == EntryTypeFolder {
+	if w.descend && w.cur.entry.IsDir() {
 		entries, err := w.serverConn.List(w.cur.path)
 
 		// an error occurred, drop out and stop walking
@@ -43,12 +44,13 @@ func (w *Walker) Next() bool {
 		}
 
 		for _, entry := range entries {
-			if entry.Name == "." || entry.Name == ".." {
+			name := entry.Name()
+			if name == "." || name == ".." {
 				continue
 			}
 
 			item := &item{
-				path:  path.Join(w.cur.path, entry.Name),
+				path:  path.Join(w.cur.path, name),
 				entry: entry,
 			}
 

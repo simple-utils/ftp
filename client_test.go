@@ -51,6 +51,12 @@ func testConn(t *testing.T, disableEPSV bool) {
 	err = c.Chmod("test", 0o755)
 	assert.NoError(err)
 
+	err = c.Chown("test", "ftp-test", "")
+	assert.NoError(err)
+
+	err = c.Chown("test", "ftp-test", "ftp-test")
+	assert.NoError(err)
+
 	_, err = c.List(".")
 	assert.NoError(err)
 
@@ -121,16 +127,16 @@ func testConn(t *testing.T, disableEPSV bool) {
 	if entry == nil {
 		t.Fatal("expected entry, got nil")
 	}
-	if entry.Size != 42 {
-		t.Errorf("entry size %q, expected %q", entry.Size, 42)
+	if entry.Size() != 42 {
+		t.Errorf("entry size %d, expected %d", entry.Size(), 42)
 	}
-	if entry.Type != EntryTypeFile {
-		t.Errorf("entry type %q, expected %q", entry.Type, EntryTypeFile)
+	if entry.IsDir() {
+		t.Errorf("entry must be a regular file, got mode %v", entry.Mode())
 	}
-	if entry.Name != "magic-file" {
-		t.Errorf("entry name %q, expected %q", entry.Name, "magic-file")
+	if entry.Name() != "magic-file" {
+		t.Errorf("entry name %q, expected %q", entry.Name(), "magic-file")
 	}
-	assert.Equal(os.FileMode(0o644).Perm(), entry.FileMode.Perm())
+	assert.Equal(os.FileMode(0o644).Perm(), entry.Mode().Perm())
 
 	entry, err = c.GetEntry("multiline-dir")
 	if err != nil {
@@ -139,16 +145,16 @@ func testConn(t *testing.T, disableEPSV bool) {
 	if entry == nil {
 		t.Fatal("expected entry, got nil")
 	}
-	if entry.Size != 0 {
-		t.Errorf("entry size %q, expected %q", entry.Size, 0)
+	if entry.Size() != 0 {
+		t.Errorf("entry size %d, expected %d", entry.Size(), 0)
 	}
-	if entry.Type != EntryTypeFolder {
-		t.Errorf("entry type %q, expected %q", entry.Type, EntryTypeFolder)
+	if !entry.IsDir() {
+		t.Errorf("entry must be a directory, got mode %v", entry.Mode())
 	}
-	if entry.Name != "multiline-dir" {
-		t.Errorf("entry name %q, expected %q", entry.Name, "multiline-dir")
+	if entry.Name() != "multiline-dir" {
+		t.Errorf("entry name %q, expected %q", entry.Name(), "multiline-dir")
 	}
-	assert.Equal(os.FileMode(0o755).Perm(), entry.FileMode.Perm())
+	assert.Equal(os.FileMode(0o755).Perm(), entry.Mode().Perm())
 	err = c.Chmod("multiline-dir", 0o744)
 	assert.NoError(err)
 
@@ -394,6 +400,33 @@ func TestTimeVsftpdFull(t *testing.T) {
 
 	assert.NoError(t, c.Quit())
 	mock.Wait()
+}
+
+func TestSiteCommandsAdvertised(t *testing.T) {
+	mock, c := openConn(t, "127.0.0.1")
+
+	assert.True(t, c.IsSiteCommandSupported("CHMOD"), "CHMOD must be advertised by mock")
+	assert.True(t, c.IsSiteCommandSupported("chown"), "lookup must be case-insensitive")
+	assert.False(t, c.IsSiteCommandSupported("UMASK"), "UMASK must not be advertised")
+
+	assert.NoError(t, c.Quit())
+	mock.Wait()
+}
+
+func TestSiteCommandNotAdvertised(t *testing.T) {
+	mock, c := openConn(t, "127.0.0.1")
+	defer func() {
+		assert.NoError(t, c.Quit())
+		mock.Wait()
+	}()
+
+	c.siteCommands = map[string]struct{}{"UMASK": {}}
+
+	err := c.Chmod("file", 0o644)
+	assert.ErrorIs(t, err, ErrSiteCommandNotSupported)
+
+	err = c.Chown("file", "user", "")
+	assert.ErrorIs(t, err, ErrSiteCommandNotSupported)
 }
 
 func TestDialWithDialFunc(t *testing.T) {
