@@ -1,4 +1,4 @@
-module github.com/jlaffaye/ftp
+module github.com/simple-utils/ftp
 
 go 1.19
 
