@@ -71,8 +71,12 @@ func testConn(t *testing.T, disableEPSV bool) {
 			assert.Equal(testData, string(buf))
 		}
 
-		r.Close()
-		r.Close() // test we can close two times
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Close(); err != nil { // test we can close two times
+			t.Fatal(err)
+		}
 	}
 
 	// Read with deadline
@@ -83,7 +87,9 @@ func testConn(t *testing.T, disableEPSV bool) {
 		}
 		_, err = io.ReadAll(r)
 		assert.ErrorContains(err, "i/o timeout")
-		r.Close()
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Read with offset
@@ -95,7 +101,9 @@ func testConn(t *testing.T, disableEPSV bool) {
 			assert.Equal(expected, string(buf))
 		}
 
-		r.Close()
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	data2 := bytes.NewBufferString(testData)
@@ -110,7 +118,9 @@ func testConn(t *testing.T, disableEPSV bool) {
 			assert.Equal(testData+testData, string(buf))
 		}
 
-		r.Close()
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	fileSize, err := c.FileSize("magic-file")

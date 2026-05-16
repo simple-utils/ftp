@@ -69,11 +69,18 @@ func (mock *ftpMock) listen() {
 	}
 
 	// Do not accept incoming connections anymore
-	mock.listener.Close()
+	if err := mock.listener.Close(); err != nil {
+		mock.t.Errorf("can not close listener: %s", err)
+		return
+	}
 
 	mock.Add(1)
 	defer mock.Done()
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			mock.t.Errorf("can not close connection: %s", err)
+		}
+	}()
 
 	mock.proto = textproto.NewConn(conn)
 	mock.printfLine("220 FTP Server ready.")
@@ -307,7 +314,7 @@ func (mock *ftpMock) listen() {
 }
 
 func (mock *ftpMock) printfLine(format string, args ...interface{}) {
-	if err := mock.proto.Writer.PrintfLine(format, args...); err != nil {
+	if err := mock.proto.PrintfLine(format, args...); err != nil {
 		mock.t.Fatal(err)
 	}
 }
@@ -416,7 +423,9 @@ func (mock *ftpMock) Addr() string {
 
 // Closes the listening socket
 func (mock *ftpMock) Close() {
-	mock.listener.Close()
+	if err := mock.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		mock.t.Errorf("can not close listener: %s", err)
+	}
 }
 
 // Helper to return a client connected to a mock server
@@ -460,6 +469,16 @@ func TestConn4(t *testing.T) {
 }
 
 func TestConn6(t *testing.T) {
+	// Some environments (containers, sandboxes, CI hosts without IPv6
+	// loopback) cannot bind to [::1]. Detect that and skip rather than fail.
+	probe, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback not available: %s", err)
+	}
+	if err := probe.Close(); err != nil {
+		t.Fatalf("can not close probe listener: %s", err)
+	}
+
 	mock, c := openConn(t, "[::1]")
 	closeConn(t, mock, c, nil)
 }
